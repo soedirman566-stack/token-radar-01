@@ -1,15 +1,75 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Token Radar: pre-token protocols ranked by implied value</title>
+<title>Token Launch Radar — pre-token protocols ranked by implied value</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
-<a class="skip" href="#board">Skip to the board</a>
-<div id="app" aria-busy="true"></div>
-<script src="../data.js"></script>
+<header class="top">
+  <div class="brand">
+    <div class="logo" aria-hidden="true"></div>
+    <div>
+      <h1>Token Launch Radar</h1>
+      <p class="tag">Protocols that record no token yet, ranked by what a launch would be worth — and how to farm each one.</p>
+    </div>
+  </div>
+  <div class="stats" id="stats"></div>
+</header>
+
+<main>
+  <section id="boardView">
+    <div class="controls">
+      <input id="q" type="search" placeholder="Search name or slug…" aria-label="Search">
+      <select id="chainSel" aria-label="Chain filter"><option value="">All chains</option></select>
+      <select id="catSel" aria-label="Category filter"><option value="">All categories</option></select>
+      <label class="chk"><input id="watchOnly" type="checkbox"> Watchlist only</label>
+      <span class="count" id="rowCount"></span>
+    </div>
+    <div class="tablewrap">
+      <table id="board">
+        <thead>
+          <tr>
+            <th data-k="rank" class="num sortable">Rank</th>
+            <th data-k="name" class="sortable">Protocol</th>
+            <th>Chains</th>
+            <th data-k="tvl" class="num sortable">TVL</th>
+            <th data-k="chg" class="num sortable">7d %</th>
+            <th data-k="fdv" class="num sortable">Implied FDV</th>
+            <th data-k="p" class="num sortable">P(launch)</th>
+            <th data-k="value" class="num sortable">Implied value</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <p class="note">Rows tagged <span class="tag-junk">NOT A CANDIDATE</span> record no token either, but they are wrapped, staked or bridged products — or an exchange's own product — so any token value already sits with the parent asset. They are ranked below the real board on purpose. A protocol here "records no token" in the snapshot data; that is not proof it has none.</p>
+  </section>
+
+  <section id="detailView" hidden>
+    <p><a href="#/" class="back">← Back to the board</a></p>
+    <div id="detail"></div>
+  </section>
+
+  <section class="how" id="how">
+    <h2>How the ranking works</h2>
+    <p>Every protocol in the snapshot that records no token is scored. The model never uses a hardcoded list of names: each category's FDV/TVL multiple is <strong>calibrated from the snapshot itself</strong>, as the median market-cap/TVL ratio of that category's already-tokenised protocols (categories with fewer than 3 tokenised peers fall back to the global median, <span class="num" id="globalMult"></span>).</p>
+    <p><strong>Implied FDV</strong> = TVL × category multiple × momentum (7-day TVL change, clamped, worth ×0.70–×1.30) × age (longer tokenless-and-large is worth up to ×1.25) × a size decay for very large TVL. <strong>Implied value</strong> = implied FDV × <strong>7.5% assumed airdrop share</strong> × P(launch), where P(launch) comes from the protocol's TVL tier, its tokenless age, its category's tokenisation rate and the sign of its momentum. Rows are ranked by implied value, highest first.</p>
+    <div class="tablewrap">
+      <table id="multTable">
+        <thead><tr><th>Category</th><th class="num">Tokenised peers</th><th class="num">Median mcap / TVL</th><th class="num">Share tokenised</th></tr></thead>
+        <tbody id="multRows"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <p>Data: DefiLlama protocol snapshot, <span id="asOf"></span>. Implied values are this board's own model, stated so a reader can disagree with them. Nothing here is financial advice.</p>
+</footer>
+
+<script src="data.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
