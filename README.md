@@ -2,7 +2,7 @@
 [![rank](https://make.fun/badge/token-radar-01/soedirman566-stack/token-radar-01/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 [![reward](https://make.fun/badge/token-radar-01/soedirman566-stack/token-radar-01/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 
-# Token Launch Radar v2
+# Token Launch Radar v3
 
 A radar for protocols that record no token yet. It reads the sealed DefiLlama
 snapshot (758 protocols), scores every one of the 342 that record no token,
@@ -13,20 +13,36 @@ list leaves out.
 
 ## The model
 
-No hardcoded names and no hardcoded multiples. Each category's FDV/TVL
-multiple is **calibrated from the snapshot itself**: the median market-cap /
-TVL ratio of that category's already-tokenised protocols (categories with
-fewer than 3 tokenised peers fall back to the global median). Then, per
-protocol:
+No hardcoded names and no hardcoded multiples. Peer multiples are
+**calibrated from the snapshot itself**, with three defences v2 lacked
+(v2 priced a $1.56B protocol at 0.6% of its TVL because its category had
+exactly three tokenised peers with a median mcap/TVL of 0.0059):
 
-- **Implied FDV** = TVL × category multiple × momentum (7-day TVL change,
-  clamped to −50…+100, worth ×0.70–×1.30) × age (tokenless-and-large is worth
-  up to ×1.25 at five years) × a size decay for very large TVL.
-- **P(launch)** blends the TVL tier, the tokenless age, the category's
-  tokenisation rate (share of its protocols that already have tokens) and the
-  sign of momentum, clamped to 5–85%.
-- **Implied value** (the rank key) = implied FDV × **7.5% assumed airdrop
-  share** × P(launch), in whole dollars.
+- **Winsorised ratios**: every tokenised protocol's market-cap / TVL ratio
+  is clamped to the snapshot's own 5th–95th percentile band before use.
+- **Size-banded weighted median**: a protocol's peer multiple is the
+  weighted median of its category's winsorised peer ratios — peers within
+  8× of its own TVL count fully, peers outside the band count 0.35 — then
+  **shrunk toward the snapshot-wide multiple** with a prior of 6 effective
+  peers and clamped to [0.05, 40]. Only 144 of the snapshot's 758 protocols
+  carry a usable ratio, so thin categories are the norm, not the exception.
+- **Ensemble FDV**: implied FDV is a geometric blend, 65% the peer model
+  and 35% a fundamentals-only model (TVL × snapshot-wide multiple ×
+  momentum × age, no category term), so a thin or missing category degrades
+  to a sane anchor instead of to noise.
+
+Then, per protocol:
+
+- **Peer FDV** = TVL × peer multiple × momentum (7-day TVL change, clamped
+  to −40…+60, worth ×0.80–×1.15) × age (tokenless-and-large is worth up to
+  ×1.25 at five years) × a size decay for very large TVL.
+- **P(launch)** is a smooth logistic in log TVL centred on $100M (v2
+  stepped through six tiers), adjusted for the tokenless age, the
+  category's tokenisation rate, the sign of momentum and chain breadth —
+  the snapshot carries no volume series, so the number of chains a protocol
+  is deployed on is the liquidity-access proxy — clamped to 5–85%.
+- **Implied value** (the rank key) = ensemble implied FDV × **7.5% assumed
+  airdrop share** × P(launch), in whole dollars.
 
 Wrapped, staked and bridged products, versioned copies and exchanges' own
 products record no token either, but they are not launch candidates: they are
@@ -39,7 +55,10 @@ A hand-written static page (no framework, no network): a sortable board with
 text search and chain / category / watchlist-only filters, watchlist rows
 badged, a per-protocol detail view with the full model breakdown and farm
 plan, and a "How the ranking works" section that prints the calibrated
-multiples table the model actually used. Farm plans come from per-category
+multiples table the model actually used. The detail view's factor strip is
+shipped per row by the program itself, so the breakdown always agrees with
+the board it wrote. Screenshots are renders of this dashboard running the
+submitted model. Farm plans come from per-category
 playbooks parameterised with each protocol's name, chains and TVL tier: every
 step names a concrete action with a dollar cost estimate and a time or
 cadence, including a points-tracking step and a one-wallet anti-sybil step.

@@ -1,14 +1,31 @@
-// Token Launch Radar v2 — peer-calibrated implied-value model.
+// Token Launch Radar v3 — winsorised, size-banded peer calibration with an
+// ensemble fundamentals anchor.
 //
 // Reads the sealed DefiLlama snapshot, ranks every protocol that records no
 // token by the implied value of a future launch, and writes board.json, the
 // dashboard (with a generated data.js), the screenshots and dossier.json.
 //
-// The category FDV/TVL multiples are not hardcoded: they are calibrated from
-// the snapshot itself, as the median market-cap/TVL ratio of the tokenised
-// protocols in each category. Implied value per protocol is
-//   TVL x category multiple x momentum x age x size decay   (implied FDV)
-//   x 7.5% assumed airdrop share x launch probability p.
+// What changed from v2 (which used a plain per-category median multiple):
+//  - Every market-cap/TVL ratio is winsorised to the snapshot's own 5th-95th
+//    percentile band before it is used, so one micro-cap outlier can no
+//    longer drag a whole category's multiple.
+//  - A protocol's peer multiple is a weighted median of its category's
+//    tokenised peers, weighted by size: peers whose TVL sits within an 8x
+//    band of the protocol's own TVL count fully, peers outside it count
+//    0.35 — a lending market is priced against lending markets its own size.
+//  - The peer estimate is shrunk toward the snapshot-wide multiple with a
+//    prior weight of 6 effective peers, so a category with two wild peers
+//    cannot produce an absurd multiple; the result is clamped to [0.05, 40].
+//  - The implied FDV is a geometric ensemble: 65% the peer model above,
+//    35% a fundamentals-only model (TVL x snapshot-wide multiple x momentum
+//    x age, no category term), so thin or missing categories degrade to a
+//    sane anchor instead of to noise.
+//  - Launch probability is a smooth logistic in log TVL instead of six
+//    steps, gains a small chain-breadth term (the snapshot has no volume
+//    series, so deployment breadth is the liquidity-access proxy), and the
+//    momentum factor is softened so one wild week moves value less.
+// Implied value per protocol is
+//   implied FDV (ensemble) x 7.5% assumed airdrop share x launch probability.
 //
 // Usage: node main.ts [inputPath] [outputDir]
 //        node main.ts --input <path> --output <dir>
@@ -42,6 +59,12 @@ interface Snapshot {
 }
 
 const AIRDROP_SHARE = 0.075;
+const PEER_WEIGHT = 0.65; // ensemble weight on the peer-calibrated model
+const SHRINK_PRIOR = 6; // effective peers of prior weight on the global multiple
+const BAND = 8; // size band: peers within BAND x of the target TVL count fully
+const BAND_WEIGHT = 0.35; // weight of a peer outside the size band
+const MULT_FLOOR = 0.05;
+const MULT_CAP = 40;
 const JUNK_CATEGORIES = new Set([
   'Bridge', 'Canonical Bridge', 'Liquid Staking', 'Liquid Restaking', 'Restaked BTC', 'CEX',
 ]);
@@ -71,50 +94,120 @@ function median(xs: number[]): number {
   return s.length % 2 === 1 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
 }
 
+function quantile(sorted: number[], q: number): number {
+  if (sorted.length === 0) return 0;
+  const pos = (sorted.length - 1) * q;
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  return sorted[base + 1] !== undefined ? sorted[base] + rest * (sorted[base + 1] - sorted[base]) : sorted[base];
+}
+
+// Weighted median: the value where cumulative weight first reaches half the
+// total weight. Deterministic for a fixed input order after sorting by value.
+function weightedMedian(items: { v: number; w: number }[]): number {
+  const s = [...items].sort((a, b) => a.v - b.v);
+  const total = s.reduce((acc, x) => acc + x.w, 0);
+  let acc = 0;
+  for (const x of s) {
+    acc += x.w;
+    if (acc >= total / 2) return x.v;
+  }
+  return s.length > 0 ? s[s.length - 1].v : 1;
+}
+
 function clamp(x: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, x));
 }
 
-interface CategoryStats {
-  multiple: number;
-  tokenisedPeers: number;
-  tokenisationRate: number;
+interface Peer {
+  ratio: number; // winsorised market-cap / TVL
+  tvl: number;
 }
 
-// Calibrate one FDV/TVL multiple per category from the snapshot's own
-// tokenised protocols; thin categories fall back to the global median.
-let globalMedianMultiple = 1;
-function calibrate(protocols: Proto[]): Map<string, CategoryStats> {
-  const allRatios: number[] = [];
-  const byCat = new Map<string, { ratios: number[]; total: number; tokenised: number }>();
+interface CategoryStats {
+  tokenisedPeers: number;
+  tokenisationRate: number;
+  representativeMultiple: number; // peer multiple at the category's median pre-token TVL
+}
+
+interface Calibration {
+  stats: Map<string, CategoryStats>;
+  peersByCat: Map<string, Peer[]>;
+  globalMultiple: number; // winsorised snapshot-wide median multiple
+}
+
+let globalMultipleValue = 1;
+
+// Calibrate from the snapshot itself: winsorise every tokenised protocol's
+// market-cap/TVL ratio into the snapshot's 5th-95th percentile band, group
+// the survivors by category, and keep the snapshot-wide winsorised median as
+// the global anchor and shrinkage target.
+function calibrate(protocols: Proto[]): Calibration {
+  const rawRatios: number[] = [];
+  for (const p of protocols) {
+    if (p.mcap_usd !== null && p.tvl_usd > 0) rawRatios.push(p.mcap_usd / p.tvl_usd);
+  }
+  const sortedRatios = [...rawRatios].sort((a, b) => a - b);
+  const lo = quantile(sortedRatios, 0.05);
+  const hi = quantile(sortedRatios, 0.95);
+  const winsorised = rawRatios.map((r) => clamp(r, lo, hi));
+  const globalMultiple = winsorised.length > 0 ? median(winsorised) : 1;
+  globalMultipleValue = globalMultiple;
+
+  const peersByCat = new Map<string, Peer[]>();
+  const totals = new Map<string, { total: number; tokenised: number; preTokenTvls: number[] }>();
   for (const p of protocols) {
     const cat = p.category ?? 'Uncategorised';
-    let e = byCat.get(cat);
-    if (!e) { e = { ratios: [], total: 0, tokenised: 0 }; byCat.set(cat, e); }
-    e.total += 1;
-    if (hasToken(p)) e.tokenised += 1;
-    if (p.mcap_usd !== null && p.tvl_usd > 0) {
-      e.ratios.push(p.mcap_usd / p.tvl_usd);
-      allRatios.push(p.mcap_usd / p.tvl_usd);
+    let t = totals.get(cat);
+    if (!t) { t = { total: 0, tokenised: 0, preTokenTvls: [] }; totals.set(cat, t); }
+    t.total += 1;
+    if (hasToken(p)) {
+      t.tokenised += 1;
+      if (p.mcap_usd !== null && p.tvl_usd > 0) {
+        const peer = { ratio: clamp(p.mcap_usd / p.tvl_usd, lo, hi), tvl: p.tvl_usd };
+        const arr = peersByCat.get(cat);
+        if (arr) arr.push(peer); else peersByCat.set(cat, [peer]);
+      }
+    } else {
+      t.preTokenTvls.push(Math.max(1, p.tvl_usd));
     }
   }
-  const globalMedian = allRatios.length > 0 ? median(allRatios) : 1;
-  globalMedianMultiple = globalMedian;
-  const out = new Map<string, CategoryStats>();
-  for (const [cat, e] of byCat) {
-    out.set(cat, {
-      multiple: e.ratios.length >= 3 ? median(e.ratios) : globalMedian,
-      tokenisedPeers: e.ratios.length,
-      tokenisationRate: e.total > 0 ? e.tokenised / e.total : 0,
+
+  const stats = new Map<string, CategoryStats>();
+  for (const [cat, t] of totals) {
+    const peers = peersByCat.get(cat) ?? [];
+    const repTvl = t.preTokenTvls.length > 0 ? median(t.preTokenTvls) : 1e8;
+    stats.set(cat, {
+      tokenisedPeers: peers.length,
+      tokenisationRate: t.total > 0 ? t.tokenised / t.total : 0,
+      representativeMultiple: peerMultiple(peers, repTvl, globalMultiple),
     });
   }
-  return out;
+  return { stats, peersByCat, globalMultiple };
+}
+
+// The peer multiple for one protocol: a size-weighted median of its
+// category's winsorised peer ratios, shrunk toward the global multiple by a
+// prior of SHRINK_PRIOR effective peers, then clamped to a sane range. A
+// category with no tokenised peers prices at the global multiple.
+function peerMultiple(peers: Peer[], tvl: number, globalMultiple: number): number {
+  if (peers.length === 0) return clamp(globalMultiple, MULT_FLOOR, MULT_CAP);
+  const items = peers.map((peer) => ({
+    v: peer.ratio,
+    w: peer.tvl >= tvl / BAND && peer.tvl <= tvl * BAND ? 1 : BAND_WEIGHT,
+  }));
+  const wm = weightedMedian(items);
+  const nEff = items.reduce((acc, x) => acc + x.w, 0);
+  const shrunk = (nEff * wm + SHRINK_PRIOR * globalMultiple) / (nEff + SHRINK_PRIOR);
+  return clamp(shrunk, MULT_FLOOR, MULT_CAP);
 }
 
 function momentumFactor(change7d: number | null): number {
   if (change7d === null) return 1;
-  const c = clamp(change7d, -50, 100);
-  return c >= 0 ? 1 + 0.003 * c : 1 + 0.006 * c; // -50 -> 0.70, +100 -> 1.30
+  // Softened from v2: a single wild week moves the value less (a +60% week
+  // is worth x1.15, not x1.30), and the clamps bite earlier.
+  const c = clamp(change7d, -40, 60);
+  return c >= 0 ? 1 + 0.0025 * c : 1 + 0.005 * c; // -40 -> 0.80, +60 -> 1.15
 }
 
 function ageInDays(listedAt: string | null, asOf: string): number | null {
@@ -134,14 +227,13 @@ function sizeFactor(tvl: number): number {
   return Math.pow(1e9 / tvl, 0.08); // very large TVL rarely launches near peer multiples
 }
 
-function launchProbability(tvl: number, days: number | null, change7d: number | null, tokenisationRate: number): number {
-  let p = tvl >= 1e9 ? 0.55
-    : tvl >= 5e8 ? 0.50
-    : tvl >= 1e8 ? 0.44
-    : tvl >= 5e7 ? 0.38
-    : tvl >= 2e7 ? 0.32
-    : tvl >= 1e7 ? 0.27
-    : 0.22;
+function launchProbability(tvl: number, days: number | null, change7d: number | null, tokenisationRate: number, chainCount: number): number {
+  // Smooth in log TVL (v2 stepped through six tiers, so two near-identical
+  // protocols either side of a tier edge got visibly different odds): a
+  // logistic centred on $100M of TVL, worth 0.16 at the smallest sizes and
+  // rising toward 0.60 for the largest.
+  const z = (Math.log10(Math.max(1, tvl)) - 8) / 0.75;
+  let p = 0.16 + 0.44 / (1 + Math.exp(-z));
   p *= 0.75 + 0.5 * tokenisationRate; // categories that tokenise, tokenise again
   if (days !== null) {
     if (days >= 730) p *= 1.15;
@@ -152,6 +244,11 @@ function launchProbability(tvl: number, days: number | null, change7d: number | 
     if (change7d > 5) p *= 1.06;
     else if (change7d < -10) p *= 0.92;
   }
+  // The snapshot carries no volume or liquidity series, so the breadth of a
+  // protocol's deployment stands in for it: a protocol live on more chains
+  // has more places a launch can be distributed and farmed. Worth up to
+  // x1.15 at six or more chains.
+  p *= 1 + 0.03 * Math.min(Math.max(0, chainCount - 1), 5);
   return clamp(p, 0.05, 0.85);
 }
 
@@ -257,6 +354,7 @@ interface Scored {
   p: Proto;
   junk: boolean;
   multiple: number;
+  fundMultiple: number;
   momF: number;
   ageF: number;
   sizeF: number;
@@ -266,21 +364,27 @@ interface Scored {
   rawValue: number;
 }
 
-function scoreAll(snap: Snapshot, stats: Map<string, CategoryStats>): Scored[] {
+function scoreAll(snap: Snapshot, cal: Calibration): Scored[] {
   const out: Scored[] = [];
   for (const p of snap.protocols) {
     if (hasToken(p)) continue; // the radar ranks only protocols still to launch
-    const st = stats.get(p.category ?? 'Uncategorised');
-    const multiple = st ? st.multiple : 1;
+    const cat = p.category ?? 'Uncategorised';
+    const st = cal.stats.get(cat);
     const tokRate = st ? st.tokenisationRate : 0;
+    const tvl = Math.max(1, p.tvl_usd); // guard: a zero or missing TVL prices at the floor, never NaN
+    const multiple = peerMultiple(cal.peersByCat.get(cat) ?? [], tvl, cal.globalMultiple);
     const days = ageInDays(p.listed_at, snap.as_of);
     const momF = momentumFactor(p.change_7d);
     const ageF = ageFactor(days);
-    const sizeF = sizeFactor(p.tvl_usd);
-    const fdv = p.tvl_usd * multiple * momF * ageF * sizeF;
-    const prob = launchProbability(p.tvl_usd, days, p.change_7d, tokRate);
+    const sizeF = sizeFactor(tvl);
+    // Ensemble: geometric blend of the peer model and a fundamentals-only
+    // model that knows no category, only the snapshot-wide multiple.
+    const fdvPeer = tvl * multiple * momF * ageF * sizeF;
+    const fdvFund = tvl * cal.globalMultiple * momF * ageF;
+    const fdv = Math.exp(PEER_WEIGHT * Math.log(fdvPeer) + (1 - PEER_WEIGHT) * Math.log(fdvFund));
+    const prob = launchProbability(tvl, days, p.change_7d, tokRate, p.chains.length);
     out.push({
-      p, junk: isJunk(p), multiple, momF, ageF, sizeF, days, prob, fdv,
+      p, junk: isJunk(p), multiple, fundMultiple: cal.globalMultiple, momF, ageF, sizeF, days, prob, fdv,
       rawValue: fdv * AIRDROP_SHARE * prob,
     });
   }
@@ -323,8 +427,8 @@ function main(): void {
   const repoDir = dirname(fileURLToPath(import.meta.url));
   const snap = JSON.parse(readFileSync(inputPath, 'utf8')) as Snapshot;
   const watch = new Set(snap.watchlist);
-  const stats = calibrate(snap.protocols);
-  const scored = scoreAll(snap, stats);
+  const cal = calibrate(snap.protocols);
+  const scored = scoreAll(snap, cal);
 
   const real = scored.filter((s) => !s.junk).sort(byValueThenSlug);
   const junk = scored.filter((s) => s.junk).sort(byValueThenSlug);
@@ -352,6 +456,8 @@ function main(): void {
     change_7d: o.s.p.change_7d,
     implied_fdv_usd: Math.round(o.s.fdv),
     launch_probability: Math.round(o.s.prob * 1000) / 1000,
+    peer_multiple: Math.round(o.s.multiple * 1000) / 1000,
+    global_multiple: Math.round(o.s.fundMultiple * 1000) / 1000,
     watchlist: watch.has(o.s.p.slug),
     launch_candidate: !o.s.junk,
   }));
@@ -368,6 +474,7 @@ function main(): void {
     const cat = r.category ?? 'Uncategorised';
     if (!catIndex.has(cat)) { catIndex.set(cat, catNames.length); catNames.push(cat); }
   }
+  const round3 = (x: number) => Math.round(x * 1000) / 1000;
   const dataRows = ordered.map((o, i) => [
     o.s.p.slug,
     o.s.p.name,
@@ -382,17 +489,22 @@ function main(): void {
     watch.has(o.s.p.slug) ? 1 : 0,
     o.s.days === null ? -1 : o.s.days,
     o.s.junk ? 1 : 0,
+    round3(o.s.multiple),
+    round3(o.s.fundMultiple),
+    round3(o.s.momF),
+    round3(o.s.ageF),
+    round3(o.s.sizeF),
   ]);
   const multTable = catNames.map((cat, idx) => {
-    const st = stats.get(cat);
-    return [idx, st ? Math.round(st.multiple * 1000) / 1000 : 1, st ? st.tokenisedPeers : 0, st ? Math.round(st.tokenisationRate * 100) : 0];
+    const st = cal.stats.get(cat);
+    return [idx, st ? round3(st.representativeMultiple) : round3(cal.globalMultiple), st ? st.tokenisedPeers : 0, st ? Math.round(st.tokenisationRate * 100) : 0];
   });
   const data = {
     asOf: snap.as_of,
     floorUsd: snap.floor_usd,
     scanned: snap.protocols.length,
     preToken: scored.length,
-    globalMult: Math.round(globalMedianMultiple * 1000) / 1000,
+    globalMult: round3(globalMultipleValue),
     cats: catNames,
     mult: multTable,
     rows: dataRows,

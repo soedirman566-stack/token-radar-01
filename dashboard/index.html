@@ -54,11 +54,11 @@
 
   <section class="how" id="how">
     <h2>How the ranking works</h2>
-    <p>Every protocol in the snapshot that records no token is scored. The model never uses a hardcoded list of names: each category's FDV/TVL multiple is <strong>calibrated from the snapshot itself</strong>, as the median market-cap/TVL ratio of that category's already-tokenised protocols (categories with fewer than 3 tokenised peers fall back to the global median, <span class="num" id="globalMult"></span>).</p>
-    <p><strong>Implied FDV</strong> = TVL × category multiple × momentum (7-day TVL change, clamped, worth ×0.70–×1.30) × age (longer tokenless-and-large is worth up to ×1.25) × a size decay for very large TVL. <strong>Implied value</strong> = implied FDV × <strong>7.5% assumed airdrop share</strong> × P(launch), where P(launch) comes from the protocol's TVL tier, its tokenless age, its category's tokenisation rate and the sign of its momentum. Rows are ranked by implied value, highest first.</p>
+    <p>Every protocol in the snapshot that records no token is scored. The model never uses a hardcoded list of names: peer multiples are <strong>calibrated from the snapshot itself</strong>. Every tokenised protocol's market-cap/TVL ratio is winsorised to the snapshot's own 5–95% band, and each protocol is priced against a size-weighted median of its category's peers — peers within 8× of its own TVL count fully, the rest at 0.35 — shrunk toward the snapshot-wide multiple (<span class="num" id="globalMult"></span>) so thin categories cannot blow up.</p>
+    <p><strong>Implied FDV</strong> is a geometric blend, 65/35: the peer model — TVL × peer multiple × momentum (7-day TVL change, clamped, worth ×0.80–×1.15) × age (longer tokenless-and-large is worth up to ×1.25) × a size decay for very large TVL — and a fundamentals model with no category term, TVL × the snapshot-wide multiple × momentum × age. <strong>Implied value</strong> = implied FDV × <strong>7.5% assumed airdrop share</strong> × P(launch), a smooth curve in TVL adjusted for tokenless age, the category's tokenisation rate, momentum and chain breadth. Rows are ranked by implied value, highest first. The table below shows each category's representative peer multiple (at its median pre-token TVL) and how many tokenised peers priced it.</p>
     <div class="tablewrap">
       <table id="multTable">
-        <thead><tr><th>Category</th><th class="num">Tokenised peers</th><th class="num">Median mcap / TVL</th><th class="num">Share tokenised</th></tr></thead>
+        <thead><tr><th>Category</th><th class="num">Tokenised peers</th><th class="num">Peer multiple</th><th class="num">Share tokenised</th></tr></thead>
         <tbody id="multRows"></tbody>
       </table>
     </div>
